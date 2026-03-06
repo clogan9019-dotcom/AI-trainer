@@ -6,3 +6,5 @@ beautifulsoup4
 tqdm
 click
 tokenizers
+psutil
+datasets
