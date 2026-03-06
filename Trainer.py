@@ -1226,6 +1226,16 @@ def load_or_train_tokenizer(texts: List[str], tokenizer_path: Path, vocab_size: 
         raise RuntimeError("tokenizers is not installed. Run: pip install tokenizers")
     if tokenizer_path.exists():
         return Tokenizer.from_file(str(tokenizer_path))
+    # Cache corpus hash to avoid retraining on identical data
+    try:
+        cache_path = tokenizer_path.with_suffix(".hash")
+        corpus_sample = "\n".join(texts[:100])
+        corpus_hash = hashlib.md5(corpus_sample.encode("utf-8", errors="ignore")).hexdigest()
+        if cache_path.exists() and tokenizer_path.exists():
+            if cache_path.read_text().strip() == corpus_hash:
+                return Tokenizer.from_file(str(tokenizer_path))
+    except Exception:
+        pass
     tokenizer = Tokenizer(BPE(unk_token="<unk>"))
     trainer = BpeTrainer(
         vocab_size=vocab_size,
@@ -1241,6 +1251,10 @@ def load_or_train_tokenizer(texts: List[str], tokenizer_path: Path, vocab_size: 
     tokenizer.train([str(tmp_path)], trainer)
     tmp_path.unlink(missing_ok=True)
     tokenizer.save(str(tokenizer_path))
+    try:
+        tokenizer_path.with_suffix(".hash").write_text(corpus_hash)
+    except Exception:
+        pass
     return tokenizer
 
 
