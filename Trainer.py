@@ -35,6 +35,10 @@ try:
     from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 except Exception:
     Tokenizer = None
+try:
+    from datasets import load_dataset
+except Exception:
+    load_dataset = None
 
 warnings.filterwarnings(
     "ignore",
@@ -656,6 +660,170 @@ class StackExchangeFetcher:
         return records
 
 
+class HFDatasetFetcher:
+    """Fetch dialogue data from Hugging Face datasets."""
+
+    def __init__(self, max_turns: int = 8, max_open_conversations: int = 500):
+        self.max_turns = max(2, max_turns)
+        self.max_open_conversations = max(50, max_open_conversations)
+
+    def _normalize_role(self, role: Optional[str]) -> Optional[str]:
+        if not role:
+            return None
+        r = str(role).lower()
+        if r in ("assistant", "bot", "gpt", "ai", "model"):
+            return "Assistant"
+        if r in ("user", "human", "prompter", "questioner", "customer"):
+            return "User"
+        return None
+
+    def _build_dialog(self, turns: List[tuple]) -> str:
+        if not turns:
+            return ""
+        cleaned = []
+        for role, text in turns:
+            if role not in ("User", "Assistant"):
+                continue
+            text = (text or "").strip()
+            if not text:
+                continue
+            if cleaned and cleaned[-1][0] == role:
+                cleaned[-1] = (role, cleaned[-1][1] + " " + text)
+            else:
+                cleaned.append((role, text))
+
+        while cleaned and cleaned[0][0] != "User":
+            cleaned.pop(0)
+        if len(cleaned) < 2:
+            return ""
+
+        if self.max_turns and len(cleaned) > self.max_turns:
+            cleaned = cleaned[-self.max_turns:]
+            if cleaned and cleaned[0][0] != "User":
+                cleaned = cleaned[1:]
+        if len(cleaned) < 2:
+            return ""
+
+        parts = [f"{role}: {text}" for role, text in cleaned]
+        return "\n".join(parts) + " <END>"
+
+    def _extract_dialog_from_row(self, row: dict) -> str:
+        if "dialog" in row and isinstance(row.get("dialog"), list):
+            turns = []
+            for i, utter in enumerate(row.get("dialog", [])):
+                role = "User" if i % 2 == 0 else "Assistant"
+                turns.append((role, str(utter)))
+            return self._build_dialog(turns)
+
+        if "utterances" in row and isinstance(row.get("utterances"), list):
+            turns = []
+            speakers = row.get("speakers")
+            for i, utter in enumerate(row.get("utterances", [])):
+                role = "User" if i % 2 == 0 else "Assistant"
+                if isinstance(speakers, list) and i < len(speakers):
+                    role = self._normalize_role(speakers[i]) or role
+                turns.append((role, str(utter)))
+            return self._build_dialog(turns)
+
+        messages = row.get("messages") or row.get("conversation") or row.get("conversations")
+        if isinstance(messages, list):
+            turns = []
+            for m in messages:
+                if not isinstance(m, dict):
+                    continue
+                role = self._normalize_role(
+                    m.get("role") or m.get("speaker") or m.get("from") or m.get("author")
+                )
+                text = m.get("content") or m.get("text") or m.get("message") or m.get("value")
+                if role and text:
+                    turns.append((role, str(text)))
+            return self._build_dialog(turns)
+
+        if "prompt" in row and "response" in row:
+            turns = [("User", str(row.get("prompt"))), ("Assistant", str(row.get("response")))]
+            return self._build_dialog(turns)
+
+        if "instruction" in row and "response" in row:
+            turns = [("User", str(row.get("instruction"))), ("Assistant", str(row.get("response")))]
+            return self._build_dialog(turns)
+
+        if "input" in row and "output" in row:
+            turns = [("User", str(row.get("input"))), ("Assistant", str(row.get("output")))]
+            return self._build_dialog(turns)
+
+        return ""
+
+    def fetch_dialogs(self, dataset_name: str, count: int = 50, splits: Optional[List[str]] = None) -> List[Dict]:
+        records = []
+        if load_dataset is None or count <= 0:
+            return records
+        splits = splits or ["train"]
+        max_per_split = max(1, count // max(len(splits), 1))
+
+        for split in splits:
+            if len(records) >= count:
+                break
+            try:
+                try:
+                    ds = load_dataset(dataset_name, split=split, streaming=True)
+                except Exception:
+                    ds = load_dataset(dataset_name, split=split)
+                conv_buffers: Dict[str, List[tuple]] = {}
+                conv_order: List[str] = []
+                for idx, row in enumerate(ds):
+                    if len(records) >= count or len(records) >= max_per_split * len(splits):
+                        break
+                    if not isinstance(row, dict):
+                        continue
+
+                    text = self._extract_dialog_from_row(row)
+                    if text:
+                        records.append({
+                            "url": f"hf://{dataset_name}/{split}/{idx}",
+                            "text": text,
+                            "source": f"hf:{dataset_name}",
+                            "timestamp": datetime.now().isoformat()
+                        })
+                        continue
+
+                    # OASST-style rows: conversation_id + text + role
+                    conv_id = row.get("conversation_id") or row.get("conversation") or row.get("conv_id")
+                    if conv_id is not None and "text" in row and "role" in row:
+                        role = self._normalize_role(row.get("role"))
+                        text = str(row.get("text") or "").strip()
+                        if not role or not text:
+                            continue
+                        conv_key = str(conv_id)
+                        buf = conv_buffers.get(conv_key)
+                        if buf is None:
+                            conv_buffers[conv_key] = [(role, text)]
+                            conv_order.append(conv_key)
+                        else:
+                            buf.append((role, text))
+                            if len(buf) > self.max_turns * 2:
+                                conv_buffers[conv_key] = buf[-self.max_turns * 2:]
+                        dialog = self._build_dialog(conv_buffers.get(conv_key, []))
+                        if dialog:
+                            records.append({
+                                "url": f"hf://{dataset_name}/{split}/{idx}",
+                                "text": dialog,
+                                "source": f"hf:{dataset_name}",
+                                "timestamp": datetime.now().isoformat()
+                            })
+                            conv_buffers.pop(conv_key, None)
+                            if conv_key in conv_order:
+                                conv_order.remove(conv_key)
+
+                        if len(conv_order) > self.max_open_conversations:
+                            drop = conv_order.pop(0)
+                            conv_buffers.pop(drop, None)
+                if len(records) >= count:
+                    break
+            except Exception:
+                continue
+        return records
+
+
 class FallbackDataSources:
     """Generate training data when Common Crawl fails"""
     
@@ -859,6 +1027,10 @@ class DataSourceManager:
             site=cfg.get("stackexchange_site", "stackoverflow"),
             api_key=cfg.get("stackexchange_key")
         )
+        self.hf_fetcher = HFDatasetFetcher(
+            max_turns=cfg.get("hf_dialog_max_turns", 8),
+            max_open_conversations=cfg.get("hf_dialog_max_open_conversations", 500),
+        )
         self.fallback = FallbackDataSources()
         self.consecutive_failures = 0
         self.seen_urls_path = self.output_dir / "seen_urls.txt"
@@ -872,10 +1044,38 @@ class DataSourceManager:
         records_out = []
         
         try:
+            use_hf_dialogs = self.config.get("use_hf_dialogs", True)
             use_stackexchange = self.config.get("use_stackexchange", True)
             use_mediawiki = self.config.get("use_mediawiki", True)
             use_commoncrawl = self.config.get("use_commoncrawl", False)
             records = []
+
+            if use_hf_dialogs and load_dataset is not None:
+                click.echo("\nFetching from Hugging Face datasets (dialogue)...")
+                hf_datasets = self.config.get("hf_dialog_datasets", [])
+                hf_splits = self.config.get("hf_dialog_splits", ["train"])
+                hf_count = self.config.get("hf_dialog_docs", max(10, count // 2))
+                if not hf_datasets:
+                    click.echo("  No Hugging Face datasets configured.")
+                else:
+                    per_dataset = max(1, hf_count // max(len(hf_datasets), 1))
+                    for ds_name in hf_datasets:
+                        if len(records) >= hf_count:
+                            break
+                        click.echo(f"  Dataset: {ds_name}")
+                        try:
+                            fetched = self.hf_fetcher.fetch_dialogs(
+                                ds_name,
+                                count=min(per_dataset, hf_count - len(records)),
+                                splits=hf_splits,
+                            )
+                            records.extend(fetched)
+                        except Exception:
+                            pass
+                        click.echo(f"  Records total so far: {len(records)}")
+            elif use_hf_dialogs and load_dataset is None:
+                click.echo("\nFetching from Hugging Face datasets (dialogue)...")
+                click.echo("  datasets library not installed; skipping.")
 
             if use_stackexchange:
                 click.echo("\nFetching from Stack Exchange API (Python training data)...")
@@ -1756,14 +1956,21 @@ class AutoTrainer:
                 "Tell me more.",
             ])
             multi_turn = self.config.get('dialogue_multiturn', True)
-            if multi_turn:
-                texts = [
-                    f"User: {random.choice(prompts)}\nAssistant: {t}\n"
-                    f"User: {random.choice(prompts)}\nAssistant: {t} <END>"
-                    for t in texts
-                ]
-            else:
-                texts = [f"User: {random.choice(prompts)}\nAssistant: {t} <END>" for t in texts]
+            formatted = []
+            for t in texts:
+                if "User:" in t and "Assistant:" in t:
+                    if "<END>" not in t:
+                        t = t.strip() + " <END>"
+                    formatted.append(t)
+                    continue
+                if multi_turn:
+                    formatted.append(
+                        f"User: {random.choice(prompts)}\nAssistant: {t}\n"
+                        f"User: {random.choice(prompts)}\nAssistant: {t} <END>"
+                    )
+                else:
+                    formatted.append(f"User: {random.choice(prompts)}\nAssistant: {t} <END>")
+            texts = formatted
         
         vocab_path = self.model_dir / 'vocab.pkl'
         tokenizer_path = self.model_dir / 'tokenizer.json'
@@ -2133,6 +2340,16 @@ def get_auto_config() -> dict:
             'https://en.wikiversity.org/w/api.php',
             'https://en.wikivoyage.org/w/api.php',
         ],
+        'use_hf_dialogs': True,
+        'hf_dialog_datasets': [
+            'OpenAssistant/oasst1',
+            'OpenAssistant/oasst2',
+            'daily_dialog',
+        ],
+        'hf_dialog_splits': ['train'],
+        'hf_dialog_docs': 50,
+        'hf_dialog_max_turns': 8,
+        'hf_dialog_max_open_conversations': 500,
         'use_stackexchange': True,
         'stackexchange_site': 'stackoverflow',
         'stackexchange_docs': 50,
