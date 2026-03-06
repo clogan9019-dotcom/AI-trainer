@@ -1951,6 +1951,8 @@ class AutoTrainer:
             # Generate sample after each epoch
             prompt = random.choice(prompts)
             sample = generator.generate(prompt, max_length=sample_len_epoch, temperature=0.7)
+            if "<END>" in sample:
+                sample = sample.split("<END>", 1)[0].strip()
             click.echo(f"Sample: {sample}")
             click.echo("-" * 40)
 
