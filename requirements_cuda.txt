@@ -1,0 +1,8 @@
+torch
+torchvision
+torchaudio
+requests
+beautifulsoup4
+tqdm
+click
+tokenizers
