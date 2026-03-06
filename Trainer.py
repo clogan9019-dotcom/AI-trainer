@@ -25,6 +25,7 @@ import random
 from urllib.parse import urlparse
 import warnings
 import math
+import pickle as pkl
 
 try:
     from tokenizers import Tokenizer
@@ -552,7 +553,17 @@ class StackExchangeFetcher:
         resp.raise_for_status()
         return resp.json()
 
-    def fetch_python(self, count: int = 50) -> List[Dict]:
+    def _html_to_text(self, html: str) -> str:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            for element in soup(["pre", "code"]):
+                element.decompose()
+            text = soup.get_text(separator=" ", strip=True)
+            return re.sub(r"\s+", " ", text)
+        except Exception:
+            return re.sub(r"<[^>]+>", " ", html)
+
+    def fetch_python(self, count: int = 50, strip_html: bool = True) -> List[Dict]:
         records = []
         if count <= 0:
             return records
@@ -574,7 +585,8 @@ class StackExchangeFetcher:
                 body = item.get("body", "")
                 if not body:
                     continue
-                text = f"{title}\n{body}"
+                text_body = self._html_to_text(body) if strip_html else body
+                text = f"{title}\n{text_body}"
                 records.append({
                     "url": item.get("link", ""),
                     "text": text,
@@ -588,7 +600,7 @@ class StackExchangeFetcher:
             page += 1
         return records
 
-    def fetch_python_qa(self, count: int = 50) -> List[Dict]:
+    def fetch_python_qa(self, count: int = 50, strip_html: bool = True) -> List[Dict]:
         records = []
         if count <= 0:
             return records
@@ -626,8 +638,9 @@ class StackExchangeFetcher:
                 a_body = answers[0].get("body", "")
                 if not a_body:
                     continue
-
-                text = f"User: {q_title}\n{q_body}\nAssistant: {a_body}"
+                q_text = self._html_to_text(q_body) if strip_html else q_body
+                a_text = self._html_to_text(a_body) if strip_html else a_body
+                text = f"User: {q_title}\n{q_text}\nAssistant: {a_text}"
                 records.append({
                     "url": q.get("link", ""),
                     "text": text,
@@ -868,11 +881,12 @@ class DataSourceManager:
                 click.echo("\nFetching from Stack Exchange API (Python training data)...")
                 se_count = self.config.get("stackexchange_docs", max(10, count // 2))
                 se_qa = self.config.get("stackexchange_qa", True)
+                se_strip = self.config.get("stackexchange_strip_html", True)
                 try:
                     if se_qa:
-                        records.extend(self.se_fetcher.fetch_python_qa(se_count))
+                        records.extend(self.se_fetcher.fetch_python_qa(se_count, strip_html=se_strip))
                     else:
-                        records.extend(self.se_fetcher.fetch_python(se_count))
+                        records.extend(self.se_fetcher.fetch_python(se_count, strip_html=se_strip))
                 except Exception:
                     pass
                 click.echo(f"  Records total so far: {len(records)}")
@@ -1261,9 +1275,18 @@ def load_or_train_tokenizer(texts: List[str], tokenizer_path: Path, vocab_size: 
 class BpeTextDataset(Dataset):
     """Dataset for BPE tokenized language modeling"""
 
-    def __init__(self, texts: List[str], tokenizer: Tokenizer, seq_length: int = 128):
+    def __init__(self, texts: List[str], tokenizer: Tokenizer, seq_length: int = 128, cache_path: Optional[Path] = None):
         self.seq_length = seq_length
         self.sequences = []
+
+        if cache_path and cache_path.exists():
+            try:
+                with open(cache_path, "rb") as f:
+                    self.sequences = pkl.load(f)
+                click.echo(f"Loaded cached BPE sequences: {len(self.sequences)}")
+                return
+            except Exception:
+                self.sequences = []
 
         click.echo("Creating BPE training sequences...")
         ids = []
@@ -1278,6 +1301,13 @@ class BpeTextDataset(Dataset):
                 self.sequences.append(seq)
 
         click.echo(f"Created {len(self.sequences)} sequences")
+        if cache_path:
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_path, "wb") as f:
+                    pkl.dump(self.sequences, f)
+            except Exception:
+                pass
 
     def __len__(self):
         return len(self.sequences)
@@ -1748,7 +1778,13 @@ class AutoTrainer:
                 tokenizer_path,
                 vocab_size=self.config.get('vocab_size', 8000)
             )
-            dataset = BpeTextDataset(texts, tokenizer, seq_length=seq_length)
+            cache_dir = self.data_dir / "cache"
+            try:
+                data_hash = hashlib.md5("\n".join(texts[:200]).encode("utf-8", errors="ignore")).hexdigest()
+            except Exception:
+                data_hash = "nocache"
+            cache_path = cache_dir / f"bpe_train_{data_hash}.pkl"
+            dataset = BpeTextDataset(texts, tokenizer, seq_length=seq_length, cache_path=cache_path)
         else:
             vocab = Vocabulary(max_vocab_size=self.config.get('vocab_size', 30000))
             if resume and vocab_path.exists():
@@ -1860,7 +1896,14 @@ class AutoTrainer:
         
         eval_texts = self._load_eval_texts()
         if model_type == 'transformer_bpe':
-            eval_dataset = BpeTextDataset(eval_texts, tokenizer, seq_length=seq_length) if eval_texts else None
+            eval_cache = None
+            if eval_texts:
+                try:
+                    eval_hash = hashlib.md5("\n".join(eval_texts[:200]).encode("utf-8", errors="ignore")).hexdigest()
+                    eval_cache = (self.data_dir / "cache") / f"bpe_eval_{eval_hash}.pkl"
+                except Exception:
+                    eval_cache = None
+            eval_dataset = BpeTextDataset(eval_texts, tokenizer, seq_length=seq_length, cache_path=eval_cache) if eval_texts else None
         else:
             eval_dataset = TextDataset(eval_texts, vocab, preprocessor, seq_length=seq_length) if eval_texts else None
         eval_loader = DataLoader(eval_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory) if eval_dataset and len(eval_dataset) > 0 else None
@@ -2093,6 +2136,7 @@ def get_auto_config() -> dict:
         'stackexchange_docs': 50,
         'stackexchange_key': '',
         'stackexchange_qa': True,
+        'stackexchange_strip_html': True,
         'use_commoncrawl': False,
         'dialogue_format': True,
         'dialogue_multiturn': True,
