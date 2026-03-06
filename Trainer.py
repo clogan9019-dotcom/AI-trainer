@@ -2130,6 +2130,12 @@ def get_auto_config() -> dict:
     return default_config
 
 
+def save_config(config: dict):
+    config_file = Path('auto_config.json')
+    with open(config_file, 'w') as f:
+        json.dump(config, f, indent=2)
+
+
 def run_chat(config: dict):
     model_dir = Path(config.get('model_dir', 'models/auto'))
     vocab_path = model_dir / 'vocab.pkl'
@@ -2205,7 +2211,8 @@ def run_chat(config: dict):
 @click.option('--test', is_flag=True, help='Test Common Crawl')
 @click.option('--gpu', is_flag=True, help='Use GPU (CUDA) if available')
 @click.option('--chat', is_flag=True, help='Interactive chat with the model')
-def main(iterations, test, gpu, chat):
+@click.option('--link', 'add_link', is_flag=True, help='Add a new data source link')
+def main(iterations, test, gpu, chat, add_link):
     """LLM Trainer"""
     
     click.echo("="*60)
@@ -2240,6 +2247,34 @@ def main(iterations, test, gpu, chat):
         config['device'] = 'cuda'
     else:
         config['device'] = 'cpu'
+
+    if add_link:
+        url = click.prompt("Enter data source URL").strip()
+        if "/w/api.php" in url:
+            endpoints = config.get("mediawiki_endpoints", [])
+            if url not in endpoints:
+                endpoints.append(url)
+                config["mediawiki_endpoints"] = endpoints
+                click.echo(f"Added MediaWiki endpoint: {url}")
+            else:
+                click.echo("Endpoint already exists.")
+        else:
+            # Default to Common Crawl domains list
+            try:
+                host = urlparse(url).netloc or url
+            except Exception:
+                host = url
+            host = host.replace("https://", "").replace("http://", "").strip("/")
+            domains = config.get("domains", [])
+            if host and host not in domains:
+                domains.append(host)
+                config["domains"] = domains
+                config["use_commoncrawl"] = True
+                click.echo(f"Added domain for Common Crawl: {host}")
+            else:
+                click.echo("Domain already exists or invalid.")
+        save_config(config)
+        return
 
     if chat:
         run_chat(config)
